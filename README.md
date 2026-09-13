@@ -10,10 +10,10 @@
 
 ## ติดตั้งครั้งแรก
 
-เปิด PowerShell แล้วเข้าโฟลเดอร์โปรเจกต์:
+เปิด PowerShell แล้วเข้าโฟลเดอร์ที่ clone โปรเจกต์ไว้ (แก้ `path\to` ให้ตรงกับเครื่องของคุณ):
 
 ```powershell
-cd "C:\Users\Kmaun\data\Git\Project\scrape_data_from_google"
+cd "path\to\scrape-data-from-google"
 ```
 
 สร้าง virtual environment และติดตั้งแพ็กเกจ:
