@@ -66,18 +66,71 @@ python google_places_scraper.py "โรงแรม พัทยา ชลบุ
 | `--output-dir` | `save_file` | โฟลเดอร์เก็บไฟล์ CSV |
 | `-o`, `--output` | อัตโนมัติ | ระบุชื่อไฟล์ CSV เอง |
 
+> สำคัญ: ทุก parameter ต้องอยู่ในคำสั่งเดียวกับ `python google_places_scraper.py`
+> ห้ามรัน `--limit`, `--wait` หรือ `--retries` แยกเป็นคำสั่งใหม่ เพราะ PowerShell
+> จะมองว่าเป็นคำสั่งที่ไม่ถูกต้อง
+
+## ค้นหาหลาย Keyword
+
+ใช้ `multi_keyword_scraper.py` และใส่ทุก keyword ไว้ในคำสั่งเดียว:
+
+```powershell
+python multi_keyword_scraper.py `
+  "คลินิกเสริมความงาม สีลม" `
+  "คลินิกทันตกรรม พร้อมพงษ์" `
+  "ร้านอาหาร ลาดพร้าว" `
+  --limit 20 `
+  --wait 8 `
+  --retries 3 `
+  --retry-wait 3 `
+  --keep-open
+```
+
+สคริปต์จะค้นหาทีละ keyword แล้วรวมทุกแถวเป็น CSV ไฟล์เดียวใน `save_file`
+คอลัมน์ `query` ใช้บอกว่าแต่ละแถวมาจาก keyword ใด และคอลัมน์อื่นเหมือนกับ
+`google_places_scraper.py` ทุกประการ
+
+ถ้ามี keyword จำนวนมาก ให้สร้างไฟล์ `keywords.txt` แบบหนึ่งคำค้นหาต่อหนึ่งบรรทัด:
+
+```text
+คลินิกเสริมความงาม สีลม
+คลินิกทันตกรรม พร้อมพงษ์
+ร้านอาหาร ลาดพร้าว
+```
+
+แล้วรัน:
+
+```powershell
+python multi_keyword_scraper.py `
+  --keywords-file keywords.txt `
+  --limit 20 `
+  --wait 8 `
+  --retries 3 `
+  --retry-wait 3 `
+  --keep-open
+```
+
+คำค้นหาที่ซ้ำกันจะถูกตัดออก และ `--limit` ใช้แยกต่อ keyword เช่น 3 keyword กับ
+`--limit 20` จะดึงได้สูงสุดประมาณ 60 ธุรกิจ
+
+ชื่อไฟล์รวมจะเป็น `{YYYY_MM_DD_HH-MM}_multi_keywords.csv` หรือกำหนดเองได้ด้วย:
+
+```powershell
+python multi_keyword_scraper.py --keywords-file keywords.txt --limit 10 -o businesses.csv --keep-open
+```
+
 ## ไฟล์ผลลัพธ์
 
 หากไม่ระบุ `-o` สคริปต์จะสร้างโฟลเดอร์ `save_file` และตั้งชื่อไฟล์อัตโนมัติ:
 
 ```text
-{คำค้นหา}_{YYYY_MM_DD_HH-MM}.csv
+{YYYY_MM_DD_HH-MM}_{คำค้นหา}.csv
 ```
 
 ตัวอย่าง:
 
 ```text
-save_file/คลินิกเสริมความงาม สีลม_2026_09_13_14-30.csv
+save_file/2026_09_13_14-30_คลินิกเสริมความงาม สีลม.csv
 ```
 
 ถ้ามีชื่อไฟล์ซ้ำ สคริปต์จะเติม `_2`, `_3` เพื่อไม่เขียนทับไฟล์เดิม
@@ -96,14 +149,17 @@ CSV ประกอบด้วยข้อมูล เช่น:
 
 - ชื่อธุรกิจ เบอร์โทร เว็บไซต์ และหมวดหมู่
 - คะแนน จำนวนรีวิว และระดับราคา
-- ที่อยู่ แขวง/ตำบล เขต/อำเภอ จังหวัด และรหัสไปรษณีย์
+- แขวง/ตำบล เขต/อำเภอ จังหวัด และรหัสไปรษณีย์
 - Latitude, longitude และ Google Maps URL
-- เวลาเปิด–ปิด สถานะธุรกิจ และ Plus Code
-- คำอธิบาย บริการ และลิงก์จอง/เมนู/สั่งซื้อ
-- รีวิวและ URL รูปที่โหลดอยู่บนหน้า
-- `raw_details_json` สำหรับรายละเอียดเพิ่มเติมที่พบใน DOM
 
 ธุรกิจบางแห่งไม่ได้ระบุข้อมูลทุกช่อง ช่องนั้นจึงอาจว่างใน CSV
+
+ชื่อคอลัมน์จะเหมือนกันทุกครั้ง:
+
+```text
+query,business_name,tel,website,category,rating,review_count,price_level,
+subdistrict,district,province,postal_code,latitude,longitude,google_maps_url
+```
 
 ## Infinite scrolling
 

@@ -40,6 +40,12 @@ PROVINCES = (
     "อุบลราชธานี",
 )
 
+CSV_FIELDS = [
+    "query", "business_name", "tel", "website", "category",
+    "rating", "review_count", "price_level", "subdistrict", "district",
+    "province", "postal_code", "latitude", "longitude", "google_maps_url",
+]
+
 
 def clean_text(value: str) -> str:
     return " ".join(value.split())
@@ -55,7 +61,7 @@ def output_path(query: str, output_dir: str, requested: str | None) -> Path:
     folder = Path(output_dir)
     folder.mkdir(parents=True, exist_ok=True)
     date_text = datetime.now().strftime("%Y_%m_%d_%H-%M")
-    filename = Path(requested).name if requested else f"{safe_filename(query)}_{date_text}.csv"
+    filename = Path(requested).name if requested else f"{date_text}_{safe_filename(query)}.csv"
     if not filename.lower().endswith(".csv"):
         filename += ".csv"
     path = folder / filename
@@ -64,6 +70,23 @@ def output_path(query: str, output_dir: str, requested: str | None) -> Path:
         path = folder / f"{Path(filename).stem}_{counter}{Path(filename).suffix}"
         counter += 1
     return path
+
+
+def save_csv(rows: list[dict[str, str]], target: Path) -> None:
+    with open(target, "w", newline="", encoding="utf-8-sig") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def print_summary(rows: list[dict[str, str]], target: Path) -> None:
+    print(f"บันทึกแล้ว {len(rows)} รายการ -> {target}")
+    print("สรุป:")
+    print(f"  มีเบอร์โทร: {sum(bool(row['tel']) for row in rows)}")
+    print(f"  มีเว็บไซต์: {sum(bool(row['website']) for row in rows)}")
+    print(f"  มีหมวดหมู่: {sum(bool(row['category']) for row in rows)}")
+    print(f"  มีที่อยู่: {sum(bool(row['location']) for row in rows)}")
+    print(f"  มีจังหวัด: {sum(bool(row['province']) for row in rows)}")
 
 
 def element_text(driver, selector: str) -> str:
@@ -334,26 +357,8 @@ def main() -> None:
         args.retries, args.retry_wait,
     )
     target = output_path(args.query, args.output_dir, args.output)
-    fields = [
-        "query", "rank", "business_name", "tel", "website", "category",
-        "rating", "review_count", "price_level", "location", "subdistrict",
-        "district", "province", "postal_code", "latitude", "longitude",
-        "opening_hours", "business_status", "plus_code", "description",
-        "service_options", "booking_url", "menu_url", "order_url",
-        "visible_reviews_json", "visible_photo_urls_json", "raw_details_json",
-        "google_maps_url",
-    ]
-    with open(target, "w", newline="", encoding="utf-8-sig") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"บันทึกแล้ว {len(rows)} รายการ -> {target}")
-    print("สรุป:")
-    print(f"  มีเบอร์โทร: {sum(bool(row['tel']) for row in rows)}")
-    print(f"  มีเว็บไซต์: {sum(bool(row['website']) for row in rows)}")
-    print(f"  มีหมวดหมู่: {sum(bool(row['category']) for row in rows)}")
-    print(f"  มีที่อยู่: {sum(bool(row['location']) for row in rows)}")
-    print(f"  มีจังหวัด: {sum(bool(row['province']) for row in rows)}")
+    save_csv(rows, target)
+    print_summary(rows, target)
 
 
 if __name__ == "__main__":
