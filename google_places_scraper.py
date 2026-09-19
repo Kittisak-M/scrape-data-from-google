@@ -10,7 +10,9 @@ import argparse
 import csv
 import json
 import re
+import sys
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -23,7 +25,33 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 
-CAPTCHA_WORDS = ("captcha", "unusual traffic", "ตรวจพบการรับส่งข้อมูลที่ผิดปกติ")
+def configure_terminal_output() -> None:
+    """Keep Thai CLI output from failing on Windows legacy code pages."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
+
+configure_terminal_output()
+
+
+CAPTCHA_WORDS = (
+    "captcha",
+    "recaptcha",
+    "unusual traffic",
+    "our systems have detected unusual traffic",
+    "verify that you're not a robot",
+    "ตรวจพบการรับส่งข้อมูลที่ผิดปกติ",
+    "โปรดยืนยันว่าคุณไม่ใช่โปรแกรมอัตโนมัติ",
+)
+
+
+class CaptchaDetected(Exception):
+    """Signal that another browser profile can be tried for this page."""
+
+
 PROVINCES = (
     "กรุงเทพมหานคร", "กระบี่", "กาญจนบุรี", "กาฬสินธุ์", "กำแพงเพชร", "ขอนแก่น",
     "จันทบุรี", "ฉะเชิงเทรา", "ชลบุรี", "ชัยนาท", "ชัยภูมิ", "ชุมพร", "เชียงราย",
@@ -41,9 +69,10 @@ PROVINCES = (
 )
 
 CSV_FIELDS = [
-    "query", "business_name", "tel", "website", "category",
+    "query", "business_name", "tel", "website", "raw_category",
     "rating", "review_count", "price_level", "subdistrict", "district",
     "province", "postal_code", "latitude", "longitude", "google_maps_url",
+    "scraped_at",
 ]
 
 
@@ -55,6 +84,21 @@ def safe_filename(value: str) -> str:
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value)
     value = re.sub(r"\s+", " ", value).strip(" .")
     return (value[:150] or "google_maps")
+
+
+def available_captcha_profiles(profile_dir: str) -> list[str]:
+    """Find higher-numbered Chrome profiles beside the active profile."""
+    current = Path(profile_dir)
+    match = re.fullmatch(r"\.chrome-profile(?:-(\d+))?", current.name)
+    if not match:
+        return []
+    current_number = int(match.group(1) or 0)
+    candidates: list[tuple[int, str]] = []
+    for path in current.parent.glob(".chrome-profile-*"):
+        suffix = re.fullmatch(r"\.chrome-profile-(\d+)", path.name)
+        if path.is_dir() and suffix and int(suffix.group(1)) > current_number:
+            candidates.append((int(suffix.group(1)), str(path)))
+    return [path for _, path in sorted(candidates)]
 
 
 def output_path(query: str, output_dir: str, requested: str | None) -> Path:
@@ -79,12 +123,35 @@ def save_csv(rows: list[dict[str, str]], target: Path) -> None:
         writer.writerows(rows)
 
 
+def autosave_paths(target: Path) -> tuple[Path, Path]:
+    """Return unused final/partial names without overwriting an older run."""
+    original_stem = target.stem
+    counter = 2
+    while True:
+        partial = target.with_name(f"{target.stem}_partial{target.suffix}")
+        if not target.exists() and not partial.exists():
+            return target, partial
+        target = target.with_name(f"{original_stem}_{counter}{target.suffix}")
+        counter += 1
+
+
+def initialize_csv(target: Path) -> None:
+    save_csv([], target)
+
+
+def append_csv_row(row: dict[str, str], target: Path) -> None:
+    """Append one completed record so earlier records survive an interruption."""
+    with open(target, "a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        writer.writerow(row)
+
+
 def print_summary(rows: list[dict[str, str]], target: Path) -> None:
     print(f"บันทึกแล้ว {len(rows)} รายการ -> {target}")
     print("สรุป:")
     print(f"  มีเบอร์โทร: {sum(bool(row['tel']) for row in rows)}")
     print(f"  มีเว็บไซต์: {sum(bool(row['website']) for row in rows)}")
-    print(f"  มีหมวดหมู่: {sum(bool(row['category']) for row in rows)}")
+    print(f"  มีหมวดหมู่: {sum(bool(row['raw_category']) for row in rows)}")
     print(f"  มีที่อยู่: {sum(bool(row['location']) for row in rows)}")
     print(f"  มีจังหวัด: {sum(bool(row['province']) for row in rows)}")
 
@@ -128,6 +195,11 @@ def address_part(address: str, labels: tuple[str, ...]) -> str:
     alternatives = "|".join(re.escape(label) for label in labels)
     match = re.search(rf"(?:{alternatives})\s*([^,\s]+(?:\s+[^,\d]+)?)", address)
     return clean_text(match.group(1)) if match else ""
+
+
+def first_address_word(value: str) -> str:
+    """ใช้ชื่อแขวง/ตำบลส่วนแรก เมื่อ Google Maps ต่อข้อความพื้นที่ถัดไปมาให้"""
+    return value.split(maxsplit=1)[0] if value else ""
 
 
 def rating_and_reviews(driver) -> tuple[str, str]:
@@ -208,24 +280,54 @@ def coordinates_from_url(url: str) -> tuple[str, str]:
     return (match.group(1), match.group(2)) if match else ("", "")
 
 
-def wait_for_manual_check(driver) -> None:
+def page_has_captcha(driver) -> bool:
+    url = driver.current_url.lower()
+    if "/sorry/" in url:
+        return True
+    if any(frame.is_displayed() for frame in driver.find_elements(
+        By.CSS_SELECTOR, 'iframe[src*="recaptcha"], iframe[src*="hcaptcha"]'
+    )):
+        return True
     body = driver.find_element(By.TAG_NAME, "body").text.lower()
-    if any(word in body for word in CAPTCHA_WORDS):
-        print("พบ CAPTCHA: กรุณาแก้ด้วยตัวเองใน Chrome")
+    return any(word in body for word in CAPTCHA_WORDS)
+
+
+def wait_for_manual_check(driver, rotate_on_captcha: bool = False) -> bool:
+    """Pause until the user has manually completed a CAPTCHA in Chrome."""
+    detected = False
+    while page_has_captcha(driver):
+        if rotate_on_captcha:
+            raise CaptchaDetected
+        detected = True
+        print("พบ CAPTCHA: โปรแกรมหยุดรอ กรุณาแก้ด้วยตัวเองใน Chrome")
         input("เมื่อเห็นหน้า Google Maps ตามปกติแล้ว ให้กด Enter ที่ Terminal: ")
+        time.sleep(2)
+    if detected:
+        print("CAPTCHA ผ่านแล้ว ทำงานต่อ")
+    return detected
 
 
-def collect_place_urls(driver, limit: int, wait_seconds: float) -> list[str]:
+def collect_place_urls(
+    driver, limit: int, wait_seconds: float, rotate_on_captcha: bool = False
+) -> list[str]:
     wait = WebDriverWait(driver, max(10, int(wait_seconds)))
     try:
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href*="/maps/place/"]')))
+        wait.until(lambda page: page_has_captcha(page) or page.find_elements(
+            By.CSS_SELECTOR, 'a[href*="/maps/place/"]'
+        ))
     except TimeoutException:
-        wait_for_manual_check(driver)
+        pass
+    if wait_for_manual_check(driver, rotate_on_captcha):
+        try:
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href*="/maps/place/"]')))
+        except TimeoutException:
+            pass
 
     seen: set[str] = set()
     urls: list[str] = []
     stagnant = 0
     while (limit == 0 or len(urls) < limit) and stagnant < 5:
+        wait_for_manual_check(driver, rotate_on_captcha)
         previous = len(urls)
         for anchor in driver.find_elements(By.CSS_SELECTOR, 'a[href*="/maps/place/"]'):
             href = anchor.get_attribute("href") or ""
@@ -245,6 +347,24 @@ def collect_place_urls(driver, limit: int, wait_seconds: float) -> list[str]:
     return urls if limit == 0 else urls[:limit]
 
 
+def wait_for_place_details(
+    driver, wait_seconds: float, rotate_on_captcha: bool = False
+) -> None:
+    """Wait only until at least one optional business detail is available."""
+    try:
+        WebDriverWait(driver, max(3, min(8, int(wait_seconds))), poll_frequency=0.2).until(
+            lambda page: page_has_captcha(page) or page.find_elements(
+                By.CSS_SELECTOR,
+                '[data-item-id^="address"], [data-item-id^="phone"], '
+                'a[data-item-id^="authority"]',
+            )
+        )
+    except TimeoutException:
+        # Some listings omit address, phone, and website. Keep the row instead of skipping it.
+        return
+    wait_for_manual_check(driver, rotate_on_captcha)
+
+
 def scrape(
     query: str,
     limit: int,
@@ -253,71 +373,122 @@ def scrape(
     keep_open: bool,
     retries: int,
     retry_wait: float,
+    on_row: Callable[[dict[str, str]], None] | None = None,
+    on_failure: Callable[[str], None] | None = None,
+    on_complete: Callable[[int, int], None] | None = None,
+    on_item_finished: Callable[[float, bool], None] | None = None,
+    captcha_profiles: list[str] | None = None,
+    on_profile_change: Callable[[str], None] | None = None,
 ) -> list[dict[str, str]]:
-    options = Options()
-    options.add_argument("--lang=th")
-    options.add_argument("--window-size=1600,1100")
-    options.add_argument(f"--user-data-dir={Path(profile_dir).resolve()}")
-    driver = webdriver.Chrome(options=options)
+    profiles = list(dict.fromkeys([profile_dir, *(captcha_profiles or [])]))
+    profile_index = 0
+    if len(profiles) > 1:
+        print(f"Chrome profile: {profiles[0]} | CAPTCHA สำรอง: {', '.join(profiles[1:])}")
+    else:
+        print(f"Chrome profile: {profiles[0]} | ไม่มี profile สำรอง; พบ CAPTCHA แล้วจะรอให้แก้เอง")
+
+    def open_browser(profile: str):
+        options = Options()
+        options.add_argument("--lang=th")
+        options.add_argument("--window-size=1600,1100")
+        options.add_argument(f"--user-data-dir={Path(profile).resolve()}")
+        return webdriver.Chrome(options=options)
+
+    driver = open_browser(profiles[profile_index])
+
+    def rotate_profile() -> None:
+        nonlocal driver, profile_index
+        try:
+            driver.quit()
+        except (ConnectionResetError, WebDriverException):
+            pass
+        profile_index += 1
+        profile = profiles[profile_index]
+        print(f"พบ CAPTCHA — เปลี่ยน Chrome profile เป็น {profile}")
+        driver = open_browser(profile)
+        if on_profile_change:
+            on_profile_change(profile)
+
     rows: list[dict[str, str]] = []
     try:
         search_url = "https://www.google.com/maps/search/" + quote(query, safe="") + "?hl=th"
-        driver.get(search_url)
-        time.sleep(wait_seconds)
-        wait_for_manual_check(driver)
-        place_urls = collect_place_urls(driver, limit, wait_seconds)
+        while True:
+            try:
+                driver.get(search_url)
+                rotate = profile_index < len(profiles) - 1
+                place_urls = collect_place_urls(driver, limit, wait_seconds, rotate)
+                break
+            except CaptchaDetected:
+                rotate_profile()
         print(f"พบลิงก์สถานที่ {len(place_urls)} รายการ")
 
         for rank, place_url in enumerate(place_urls, 1):
-            for attempt in range(1, retries + 1):
+            item_started = time.perf_counter()
+            attempt = 1
+            while attempt <= retries:
                 try:
                     driver.get(place_url)
                     WebDriverWait(driver, max(10, int(wait_seconds))).until(
+                        lambda page: page_has_captcha(page) or page.find_elements(
+                            By.CSS_SELECTOR, "h1.DUwDvf, h1"
+                        )
+                    )
+                    wait_for_manual_check(driver, profile_index < len(profiles) - 1)
+                    WebDriverWait(driver, max(10, int(wait_seconds))).until(
                         EC.presence_of_element_located((By.CSS_SELECTOR, "h1.DUwDvf, h1"))
                     )
-                    time.sleep(0.7)
+                    wait_for_place_details(
+                        driver,
+                        wait_seconds,
+                        profile_index < len(profiles) - 1,
+                    )
                     name = element_text(driver, "h1.DUwDvf") or element_text(driver, "h1")
+                    if not name:
+                        wait_for_manual_check(driver, profile_index < len(profiles) - 1)
+                        raise TimeoutException("ไม่พบชื่อธุรกิจในหน้าสถานที่")
                     address = item_text(driver, "address")
                     phone = item_text(driver, "phone")
-                    category = element_text(driver, "button.DkEaL")
+                    raw_category = element_text(driver, "button.DkEaL")
                     website = item_link(driver, "authority")
                     rating, review_count = rating_and_reviews(driver)
-                    hours = opening_hours(driver)
                     postal_match = re.search(r"\b\d{5}\b", address)
                     latitude, longitude = coordinates_from_url(driver.current_url)
-                    rows.append({
+                    row = {
                         "query": query,
                         "rank": str(rank),
                         "business_name": name,
                         "tel": phone,
                         "website": website or "",
-                        "category": category,
+                        "raw_category": raw_category,
                         "rating": rating,
                         "review_count": review_count,
                         "price_level": element_text(driver, "span.mgr77e"),
                         "location": address,
-                        "subdistrict": address_part(address, ("แขวง", "ตำบล", "ต.")),
+                        "subdistrict": first_address_word(address_part(address, ("แขวง", "ตำบล", "ต."))),
                         "district": address_part(address, ("เขต", "อำเภอ", "อ.")),
                         "province": province_from_address(address),
                         "postal_code": postal_match.group(0) if postal_match else "",
                         "latitude": latitude,
                         "longitude": longitude,
-                        "opening_hours": hours,
-                        "business_status": item_text(driver, "oh"),
-                        "plus_code": item_text(driver, "oloc"),
-                        "description": element_text(driver, "div.WeS02d, div.PYvSYb"),
-                        "service_options": element_text(driver, "div.iP2t7d, div.LBgpqf"),
-                        "booking_url": item_link(driver, "appointment") or item_link(driver, "reservation"),
-                        "menu_url": item_link(driver, "menu"),
-                        "order_url": item_link(driver, "order"),
-                        "visible_reviews_json": visible_reviews(driver),
-                        "visible_photo_urls_json": visible_photo_urls(driver),
-                        "raw_details_json": raw_item_details(driver),
                         "google_maps_url": driver.current_url,
-                    })
-                    print(f"[{rank}/{len(place_urls)}] {name}")
+                        "scraped_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    }
+                    wait_for_manual_check(driver, profile_index < len(profiles) - 1)
+                    rows.append(row)
+                    if on_row:
+                        on_row(row)
+                    elapsed = time.perf_counter() - item_started
+                    if on_item_finished:
+                        on_item_finished(elapsed, True)
+                    print(
+                        f"[{rank}/{len(place_urls)}] {name} "
+                        f"| ใช้เวลา {elapsed:.2f} วินาที"
+                    )
                     break
-                except (StaleElementReferenceException, TimeoutException, WebDriverException) as error:
+                except CaptchaDetected:
+                    rotate_profile()
+                    print(f"[{rank}/{len(place_urls)}] เปิดรายการเดิมอีกครั้ง")
+                except (ConnectionResetError, StaleElementReferenceException, TimeoutException, WebDriverException) as error:
                     if attempt < retries:
                         delay = retry_wait * attempt
                         print(
@@ -326,14 +497,26 @@ def scrape(
                         )
                         time.sleep(delay)
                     else:
+                        elapsed = time.perf_counter() - item_started
                         print(
                             f"[{rank}/{len(place_urls)}] ข้ามหลัง retry {retries} ครั้ง: "
-                            f"{type(error).__name__}"
+                            f"{type(error).__name__} | ใช้เวลา {elapsed:.2f} วินาที"
                         )
+                        if on_item_finished:
+                            on_item_finished(elapsed, False)
+                        if on_failure:
+                            on_failure(type(error).__name__)
+                    attempt += 1
+        if on_complete:
+            on_complete(len(rows), len(place_urls))
     finally:
         if keep_open:
             input("เสร็จแล้ว กด Enter เพื่อปิด Chrome: ")
-        driver.quit()
+        try:
+            driver.quit()
+        except (ConnectionResetError, WebDriverException):
+            # Chrome/ChromeDriver may already have exited after a network reset.
+            pass
     return rows
 
 
@@ -345,6 +528,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=20, help="จำนวนสูงสุด; ใช้ 0 เพื่อดึงจนไม่มีรายการใหม่")
     parser.add_argument("--wait", type=float, default=8.0)
     parser.add_argument("--profile", default=".chrome-profile", help="โฟลเดอร์เก็บ browser session")
+    parser.add_argument("--captcha-profiles", nargs="+", help="profile สำรองที่จะสลับไปเมื่อพบ CAPTCHA")
     parser.add_argument("--keep-open", action="store_true", help="ค้าง Chrome ไว้จนกว่าจะกด Enter")
     parser.add_argument("--retries", type=int, default=3, help="จำนวนครั้งสูงสุดต่อรายการ")
     parser.add_argument("--retry-wait", type=float, default=2.0, help="เวลารอก่อน retry เป็นวินาที")
@@ -352,13 +536,60 @@ def main() -> None:
     if args.limit < 0 or args.wait < 0 or args.retries < 1 or args.retry_wait < 0:
         parser.error("ค่าตัวเลขไม่ถูกต้อง: retries ต้องอย่างน้อย 1 และค่าเวลา/limit ต้องไม่ติดลบ")
 
-    rows = scrape(
-        args.query, args.limit, args.wait, args.profile, args.keep_open,
-        args.retries, args.retry_wait,
+    captcha_profiles = (
+        args.captcha_profiles if args.captcha_profiles is not None
+        else available_captcha_profiles(args.profile)
     )
-    target = output_path(args.query, args.output_dir, args.output)
-    save_csv(rows, target)
+
+    final_target, partial_target = autosave_paths(
+        output_path(args.query, args.output_dir, args.output)
+    )
+    initialize_csv(partial_target)
+    rows: list[dict[str, str]] = []
+    item_timings: list[float] = []
+    complete = True
+
+    def autosave(row: dict[str, str]) -> None:
+        append_csv_row(row, partial_target)
+        rows.append(row)
+
+    def mark_failure(_error_name: str) -> None:
+        nonlocal complete
+        complete = False
+
+    def item_finished(elapsed: float, _success: bool) -> None:
+        item_timings.append(elapsed)
+
+    try:
+        scrape(
+            query=args.query,
+            limit=args.limit,
+            wait_seconds=args.wait,
+            profile_dir=args.profile,
+            keep_open=args.keep_open,
+            retries=args.retries,
+            retry_wait=args.retry_wait,
+            on_row=autosave,
+            on_failure=mark_failure,
+            on_item_finished=item_finished,
+            captcha_profiles=captcha_profiles,
+        )
+    except KeyboardInterrupt:
+        complete = False
+        print("\nหยุดด้วย Ctrl+C — เก็บข้อมูลที่บันทึกสำเร็จแล้วไว้ให้")
+    except Exception as error:
+        complete = False
+        print(f"\nเกิด error: {type(error).__name__}: {error}")
+
+    target = partial_target
+    if complete:
+        partial_target.replace(final_target)
+        target = final_target
+    else:
+        print("การ scrape ไม่สมบูรณ์ ไฟล์จึงลงท้ายด้วย _partial.csv")
     print_summary(rows, target)
+    if item_timings:
+        print(f"เวลาเฉลี่ย: {sum(item_timings) / len(item_timings):.2f} วินาที/รายการ")
 
 
 if __name__ == "__main__":

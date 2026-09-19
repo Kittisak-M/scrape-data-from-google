@@ -3,8 +3,17 @@ venv/
 __pycache__/
 *.py[cod]
 .chrome-profile/
+.chrome-profile-*/
 save_file/*
 !save_file/.gitkeep
+raw_data/*
+!raw_data/.gitkeep
+clean_data/*
+!clean_data/.gitkeep
+done_raw_data/*
+!done_raw_data/.gitkeep
+quality_reports/*
+!quality_reports/.gitkeep
 *.csv
 .env
 .env.*
